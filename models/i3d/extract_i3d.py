@@ -16,7 +16,6 @@ from models.transforms import (Clamp, PermuteAndUnsqueeze, PILToTensor,
 from utils.io import reencode_video_with_diff_fps
 from utils.utils import dp_state_to_normal, show_predictions_on_dataset
 
-
 class ExtractI3D(BaseExtractor):
 
     def __init__(self, args) -> None:
@@ -38,6 +37,7 @@ class ExtractI3D(BaseExtractor):
         self.extraction_fps = args.extraction_fps
         self.step_size = 64 if args.step_size is None else args.step_size
         self.stack_size = 64 if args.stack_size is None else args.stack_size
+        self.window_size = 21 if args.window_size is None else args.window_size
         self.resize_transforms = torchvision.transforms.Compose([
             torchvision.transforms.ToPILImage(),
             ResizeImproved(self.min_side_size),
@@ -90,40 +90,37 @@ class ExtractI3D(BaseExtractor):
         first_frame = True
         padder = None
         stack_counter = 0
+
         while cap.isOpened():
             frame_exists, rgb = cap.read()
-
-            if first_frame:
-                first_frame = False
-                if frame_exists is False:
-                    continue
-
             if frame_exists:
-                # preprocess the image
                 rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
                 rgb = self.resize_transforms(rgb)
                 rgb = rgb.unsqueeze(0)
-
-                if self.flow_type == 'raft' and padder is None:
-                    padder = InputPadder(rgb.shape)
-
                 rgb_stack.append(rgb)
-
-                # - 1 is used because we need B+1 frames to calculate B frames
-                if len(rgb_stack) - 1 == self.stack_size:
-                    batch_feats_dict = self.run_on_a_stack(rgb_stack, stack_counter, padder)
-                    for stream in self.streams:
-                        feats_dict[stream].extend(batch_feats_dict[stream].tolist())
-                    # leaving the elements if step_size < stack_size so they will not be loaded again
-                    # if step_size == stack_size one element is left because the flow between the last element
-                    # in the prev list and the first element in the current list
-                    rgb_stack = rgb_stack[self.step_size:]
-                    stack_counter += 1
-                    timestamps_ms.append(cap.get(cv2.CAP_PROP_POS_MSEC))
+                timestamps_ms.append(cap.get(cv2.CAP_PROP_POS_MSEC))
             else:
                 # we don't run inference if the stack is not full (applicable for i3d)
                 cap.release()
                 break
+
+        if self.flow_type == 'raft' and padder is None:
+            padder = InputPadder(rgb_stack[0].shape)
+
+        for i in range(len(rgb_stack)):
+            start_index = max(i - self.window_size // 2, 0)
+            end_index = min(i + self.window_size // 2, len(rgb_stack) - 1)
+            windowed_rgb_stack = rgb_stack[start_index:end_index]
+            if end_index - start_index < self.window_size - 1:
+                zero_array = [torch.zeros_like(rgb_stack[0]) for _ in range(end_index - start_index)]
+                if start_index == 0:
+                    windowed_rgb_stack = zero_array + windowed_rgb_stack 
+                elif end_index == len(rgb_stack) - 1:
+                    windowed_rgb_stack = windowed_rgb_stack + zero_array 
+
+            batch_feats_dict = self.run_on_a_stack(windowed_rgb_stack, stack_counter, padder)
+            for stream in self.streams:
+                feats_dict[stream].extend(batch_feats_dict[stream].tolist())
 
         # removes the video with different fps if it was created to preserve disk space
         if (self.extraction_fps is not None) and (not self.keep_tmp_files):
