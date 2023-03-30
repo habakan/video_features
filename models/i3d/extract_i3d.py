@@ -136,8 +136,6 @@ class ExtractI3D(BaseExtractor):
                 for stream in self.streams:
                     feats_dict[stream].extend(batch_feats_dict[stream].tolist())
         else:
-            if self.flow_type == 'raft' and padder is None:
-                padder = InputPadder(rgb_stack[0].shape)
             
             n_frames = count_files(video_path) 
 
@@ -152,6 +150,9 @@ class ExtractI3D(BaseExtractor):
                     rgb = self.resize_transforms(rgb)
                     rgb = rgb.unsqueeze(0)
                     rgb_stack.append(rgb)
+
+                if self.flow_type == 'raft' and padder is None:
+                    padder = InputPadder(rgb_stack[0].shape)
 
                 for i in range(len(rgb_stack)):
                     start_index = max(i - self.window_size // 2, 0)
