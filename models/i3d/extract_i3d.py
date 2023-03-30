@@ -16,6 +16,19 @@ from models.transforms import (Clamp, PermuteAndUnsqueeze, PILToTensor,
 from utils.io import reencode_video_with_diff_fps
 from utils.utils import dp_state_to_normal, show_predictions_on_dataset
 
+def count_files(folder_path):
+    # フォルダ内のファイル数をカウントするための変数を初期化
+    file_count = 0
+
+    # フォルダ内のすべてのファイルに対して処理を行う
+    for filename in os.listdir(folder_path):
+        # ファイルであればカウントを増やす
+        if os.path.isfile(os.path.join(folder_path, filename)):
+            file_count += 1
+
+    # カウントしたファイル数を返す
+    return file_count
+
 class ExtractI3D(BaseExtractor):
 
     def __init__(self, args) -> None:
@@ -63,7 +76,7 @@ class ExtractI3D(BaseExtractor):
         self.name2module = self.load_model()
 
     @torch.no_grad()
-    def extract(self, video_path: str) -> Dict[str, np.ndarray]:
+    def extract(self, video_path: str, is_video=False) -> Dict[str, np.ndarray]:
         """The extraction call. Made to clean the forward call a bit.
 
         Arguments:
@@ -91,36 +104,70 @@ class ExtractI3D(BaseExtractor):
         padder = None
         stack_counter = 0
 
-        while cap.isOpened():
-            frame_exists, rgb = cap.read()
-            if frame_exists:
-                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-                rgb = self.resize_transforms(rgb)
-                rgb = rgb.unsqueeze(0)
-                rgb_stack.append(rgb)
-                timestamps_ms.append(cap.get(cv2.CAP_PROP_POS_MSEC))
-            else:
-                # we don't run inference if the stack is not full (applicable for i3d)
-                cap.release()
-                break
+        if is_video:
+            while cap.isOpened():
+                frame_exists, rgb = cap.read()
+                if frame_exists:
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                    rgb = self.resize_transforms(rgb)
+                    rgb = rgb.unsqueeze(0)
+                    rgb_stack.append(rgb)
+                    timestamps_ms.append(cap.get(cv2.CAP_PROP_POS_MSEC))
+                else:
+                    # we don't run inference if the stack is not full (applicable for i3d)
+                    cap.release()
+                    break
 
-        if self.flow_type == 'raft' and padder is None:
-            padder = InputPadder(rgb_stack[0].shape)
+            if self.flow_type == 'raft' and padder is None:
+                padder = InputPadder(rgb_stack[0].shape)
 
-        for i in range(len(rgb_stack)):
-            start_index = max(i - self.window_size // 2, 0)
-            end_index = min(i + self.window_size // 2, len(rgb_stack) - 1)
-            windowed_rgb_stack = rgb_stack[start_index:end_index]
-            if end_index - start_index < self.window_size - 1:
-                zero_array = [torch.zeros_like(rgb_stack[0]) for _ in range(end_index - start_index)]
-                if start_index == 0:
-                    windowed_rgb_stack = zero_array + windowed_rgb_stack 
-                elif end_index == len(rgb_stack) - 1:
-                    windowed_rgb_stack = windowed_rgb_stack + zero_array 
+            for i in range(len(rgb_stack)):
+                start_index = max(i - self.window_size // 2, 0)
+                end_index = min(i + self.window_size // 2, len(rgb_stack) - 1)
+                windowed_rgb_stack = rgb_stack[start_index:end_index]
+                if end_index - start_index < self.window_size - 1:
+                    zero_array = [torch.zeros_like(rgb_stack[0]) for _ in range(end_index - start_index)]
+                    if start_index == 0:
+                        windowed_rgb_stack = zero_array + windowed_rgb_stack 
+                    elif end_index == len(rgb_stack) - 1:
+                        windowed_rgb_stack = windowed_rgb_stack + zero_array 
 
-            batch_feats_dict = self.run_on_a_stack(windowed_rgb_stack, stack_counter, padder)
-            for stream in self.streams:
-                feats_dict[stream].extend(batch_feats_dict[stream].tolist())
+                batch_feats_dict = self.run_on_a_stack(windowed_rgb_stack, stack_counter, padder)
+                for stream in self.streams:
+                    feats_dict[stream].extend(batch_feats_dict[stream].tolist())
+        else:
+            if self.flow_type == 'raft' and padder is None:
+                padder = InputPadder(rgb_stack[0].shape)
+            
+            n_frames = count_files(video_path) 
+
+            rgb_stack = []
+            for i in range(n_frames):
+                start_index = max(i - self.window_size // 2, 0)
+                end_index = min(i + self.window_size // 2, len(rgb_stack) - 1)
+                get_frames = [j for j in range(start_index, i + end_index)]
+                for j in get_frames:
+                    rgb = cv2.imread(os.path.join(video_path, '{:4d}.jpg'.format(j)))
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                    rgb = self.resize_transforms(rgb)
+                    rgb = rgb.unsqueeze(0)
+                    rgb_stack.append(rgb)
+
+                for i in range(len(rgb_stack)):
+                    start_index = max(i - self.window_size // 2, 0)
+                    end_index = min(i + self.window_size // 2, len(rgb_stack) - 1)
+                    windowed_rgb_stack = rgb_stack[start_index:end_index]
+                    if end_index - start_index < self.window_size - 1:
+                        zero_array = [torch.zeros_like(rgb_stack[0]) for _ in range(end_index - start_index)]
+                        if start_index == 0:
+                            windowed_rgb_stack = zero_array + windowed_rgb_stack 
+                        elif end_index == len(rgb_stack) - 1:
+                            windowed_rgb_stack = windowed_rgb_stack + zero_array 
+
+                    batch_feats_dict = self.run_on_a_stack(windowed_rgb_stack, stack_counter, padder)
+                    for stream in self.streams:
+                        feats_dict[stream].extend(batch_feats_dict[stream].tolist())
+
 
         # removes the video with different fps if it was created to preserve disk space
         if (self.extraction_fps is not None) and (not self.keep_tmp_files):
